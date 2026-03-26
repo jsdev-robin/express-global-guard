@@ -1,0 +1,67 @@
+{
+  "name": "express-global-guard",
+  "version": "1.1.0",
+  "private": false,
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jsdev-robin/express-global-guard.git"
+  },
+  "keywords": [
+    "express",
+    "error",
+    "middleware",
+    "global-error-handler",
+    "nodejs",
+    "typescript",
+    "api",
+    "http-errors",
+    "validation",
+    "jwt",
+    "database",
+    "robust-error-handling",
+    "production-ready"
+  ],
+  "author": "jsdev.robin@gmail.com",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/jsdev-robin/express-global-guard/issues"
+  },
+  "homepage": "https://github.com/jsdev-robin/express-global-guard#readme",
+  "description": "A robust global error handler for Express apps, handling HTTP, validation, JWT, and database errors in Node.js/TypeScript projects.",
+  "peerDependencies": {
+    "express": "^4 || ^5"
+  },
+  "dependencies": {
+    "express-http-exception": "^1.1.0",
+    "http-status-codes": "^2.3.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.5.0",
+    "eslint": "^10.1.0",
+    "globals": "^17.4.0",
+    "jiti": "^2.6.1",
+    "typescript": "5.2.2",
+    "typescript-eslint": "^8.57.2"
+  }
+}
