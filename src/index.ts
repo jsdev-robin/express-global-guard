@@ -1,197 +1,347 @@
-import { NextFunction, Request, Response } from 'express';
-import { HTTPException } from 'express-http-exception';
+import { NextFunction, Request, RequestHandler, Response } from 'express';
+import createError, { HttpError, isHttpError } from 'http-errors';
 import { StatusCodes } from 'http-status-codes';
+import pino, { Logger } from 'pino';
 
-interface CustomError extends Error {
+export interface CustomError extends Error {
   statusCode?: number;
-  status?: string;
-  isOperational?: boolean;
+  status?: number;
+  errStatus?: string;
   path?: string;
   value?: string;
   code?: number;
-  errmsg?: string;
   errors?: Record<string, { message: string }>;
   reason?: unknown;
+  headers?: Record<string, string>;
 }
 
-const handleInvalidFieldError = (err: CustomError) =>
-  new HTTPException(
-    `Invalid input for "${err.path}": "${err.value}". Provide valid data.`,
+type ErrorTransformer = (err: CustomError) => HttpError;
+type Environment = 'development' | 'staging' | 'production' | 'test';
+
+const ENV = (process.env.NODE_ENV ?? 'production') as Environment;
+const IS_DEV = ENV === 'development';
+const IS_STAGING = ENV === 'staging';
+
+const transport = process.stdout.isTTY
+  ? { transport: { target: 'pino-pretty', options: { colorize: true } } }
+  : {};
+
+const logger: Logger = pino({
+  level: process.env.LOG_LEVEL ?? 'info',
+  base: {
+    service: process.env.SERVICE_NAME ?? 'api',
+    env: ENV,
+  },
+  timestamp: pino.stdTimeFunctions.isoTime,
+  ...transport,
+});
+
+const sanitizeStatusCode = (code: unknown): number => {
+  const num = Number(code);
+  return Number.isInteger(num) && num >= 100 && num <= 599
+    ? num
+    : StatusCodes.INTERNAL_SERVER_ERROR;
+};
+
+const normalizeError = (err: unknown): CustomError => {
+  if (err instanceof Error) return err as CustomError;
+  if (typeof err === 'string') return new Error(err) as CustomError;
+  if (err !== null && typeof err === 'object') {
+    const e = new Error(
+      String((err as Record<string, unknown>).message ?? 'Unknown error'),
+    ) as CustomError;
+    Object.assign(e, err);
+    return e;
+  }
+  return new Error('Unknown error occurred') as CustomError;
+};
+
+const getClientIp = (req: Request): string => {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string') {
+    return forwarded.split(',')[0].trim();
+  }
+  return req.socket?.remoteAddress ?? req.ip ?? 'unknown';
+};
+
+const getRequestId = (req: Request): string =>
+  (req.headers['x-request-id'] as string) ??
+  (req.headers['x-correlation-id'] as string) ??
+  crypto.randomUUID();
+
+const handleInvalidFieldError: ErrorTransformer = (err) =>
+  createError(
     StatusCodes.BAD_REQUEST,
+    `Invalid input for "${err.path}": "${err.value}". Provide valid data.`,
   );
 
-const handleDuplicateValueError = () =>
-  new HTTPException(
-    'Duplicate entry detected. Provide a unique value.',
+const handleDuplicateValueError: ErrorTransformer = () =>
+  createError(
     StatusCodes.CONFLICT,
+    'Duplicate entry detected. Provide a unique value.',
   );
 
-const handleInputValidationError = (err: CustomError) => {
+const handleInputValidationError: ErrorTransformer = (err) => {
   const messages = Object.values(err.errors ?? {})
     .map((e) => e.message)
     .join('. ');
-  return new HTTPException(
-    `Validation errors: ${messages}`,
+  return createError(
     StatusCodes.UNPROCESSABLE_ENTITY,
+    `Validation errors: ${messages}`,
   );
 };
 
-const handleDocumentNotFoundError = () =>
-  new HTTPException('Requested resource not found.', StatusCodes.NOT_FOUND);
+const handleDocumentNotFoundError: ErrorTransformer = () =>
+  createError(StatusCodes.NOT_FOUND, 'Requested resource not found.');
 
-const handleStrictModeError = (err: CustomError) =>
-  new HTTPException(
-    `Field "${err.path}" is not allowed by strict schema.`,
+const handleStrictModeError: ErrorTransformer = (err) =>
+  createError(
     StatusCodes.BAD_REQUEST,
+    `Field "${err.path}" is not allowed by strict schema.`,
   );
 
-const handleMissingSchemaError = (err: CustomError) =>
-  new HTTPException(
+const handleMissingSchemaError: ErrorTransformer = (err) =>
+  createError(
+    StatusCodes.INTERNAL_SERVER_ERROR,
     `Schema missing: ${err.message}`,
-    StatusCodes.INTERNAL_SERVER_ERROR,
   );
 
-const handleDisconnectedError = () =>
-  new HTTPException(
-    'Database connection lost. Try again later.',
+const handleDisconnectedError: ErrorTransformer = () =>
+  createError(
     StatusCodes.SERVICE_UNAVAILABLE,
+    'Database connection lost. Try again later.',
   );
 
-const handleInvalidTokenError = () =>
-  new HTTPException('Invalid session token.', StatusCodes.UNAUTHORIZED);
+const handleInvalidTokenError: ErrorTransformer = () =>
+  createError(StatusCodes.UNAUTHORIZED, 'Invalid session token.');
 
-const handleExpiredTokenError = () =>
-  new HTTPException('Session token expired.', StatusCodes.UNAUTHORIZED);
+const handleExpiredTokenError: ErrorTransformer = () =>
+  createError(StatusCodes.UNAUTHORIZED, 'Session token expired.');
 
-const handleInactiveTokenError = () =>
-  new HTTPException('Token not yet active.', StatusCodes.UNAUTHORIZED);
+const handleInactiveTokenError: ErrorTransformer = () =>
+  createError(StatusCodes.UNAUTHORIZED, 'Token not yet active.');
 
-const handleMongoServerError = (err: CustomError) => {
-  if (err.code === 11000) return handleDuplicateValueError();
-  return new HTTPException(
-    'Database server error.',
-    StatusCodes.INTERNAL_SERVER_ERROR,
-  );
-};
+const handleMongoServerError: ErrorTransformer = (err) =>
+  err.code === 11000
+    ? handleDuplicateValueError(err)
+    : createError(StatusCodes.INTERNAL_SERVER_ERROR, 'Database server error.');
 
-const handleNodeError = (err: CustomError) => {
+const handleNodeError: ErrorTransformer = (err) => {
   switch (err.name) {
     case 'SyntaxError':
-      return new HTTPException(
-        `Syntax error: ${err.message}`,
+      return createError(
         StatusCodes.BAD_REQUEST,
+        `Syntax error: ${err.message}`,
       );
     case 'TypeError':
-      return new HTTPException(
-        `Type error: ${err.message}`,
+      return createError(
         StatusCodes.INTERNAL_SERVER_ERROR,
+        `Type error: ${err.message}`,
       );
     case 'ReferenceError':
-      return new HTTPException(
-        `Reference error: ${err.message}`,
+      return createError(
         StatusCodes.INTERNAL_SERVER_ERROR,
+        `Reference error: ${err.message}`,
       );
     case 'RangeError':
-      return new HTTPException(
-        `Range error: ${err.message}`,
+      return createError(
         StatusCodes.INTERNAL_SERVER_ERROR,
+        `Range error: ${err.message}`,
       );
     case 'EvalError':
-      return new HTTPException(
-        `Eval error: ${err.message}`,
+      return createError(
         StatusCodes.INTERNAL_SERVER_ERROR,
+        `Eval error: ${err.message}`,
       );
     case 'URIError':
-      return new HTTPException(
-        `URI error: ${err.message}`,
-        StatusCodes.BAD_REQUEST,
-      );
+      return createError(StatusCodes.BAD_REQUEST, `URI error: ${err.message}`);
     default:
-      return err instanceof HTTPException
+      return isHttpError(err)
         ? err
-        : new HTTPException(
-            'Internal server error.',
+        : createError(
             StatusCodes.INTERNAL_SERVER_ERROR,
+            'Internal server error.',
           );
   }
 };
 
-const sendError = (err: CustomError, res: Response, isDev: boolean) => {
-  const statusCode = err.statusCode ?? StatusCodes.INTERNAL_SERVER_ERROR;
-  const status = err.status ?? 'error';
+const errorTransformers: Readonly<Record<string, ErrorTransformer>> =
+  Object.freeze({
+    CastError: handleInvalidFieldError,
+    ValidationError: handleInputValidationError,
+    DocumentNotFoundError: handleDocumentNotFoundError,
+    StrictModeError: handleStrictModeError,
+    MissingSchemaError: handleMissingSchemaError,
+    DisconnectedError: handleDisconnectedError,
+    JsonWebTokenError: handleInvalidTokenError,
+    TokenExpiredError: handleExpiredTokenError,
+    NotBeforeError: handleInactiveTokenError,
+  });
 
-  if (isDev) {
-    res.status(statusCode).json({
-      status,
-      error: err,
-      message: err.message,
-      stack: err.stack,
-    });
-  } else {
-    if (err.isOperational) {
-      res.status(statusCode).json({ status, message: err.message });
-    } else {
-      res.status(StatusCodes.INTERNAL_SERVER_ERROR).json({
-        status: 'error',
-        message: 'Something went wrong. Try again later.',
-      });
-    }
+const resolveError = (err: CustomError): HttpError => {
+  const transform = errorTransformers[err.name];
+  if (transform) return transform(err);
+  if (err.code === 11000 || err.name === 'MongoServerError') {
+    return handleMongoServerError(err);
   }
+  return handleNodeError(err);
 };
 
-export const globalErrorHandler = (
-  err: CustomError,
-  _req: Request,
+const sendError = (
+  err: HttpError & CustomError,
   res: Response,
-  next: NextFunction,
-) => {
-  err.statusCode = err.statusCode ?? StatusCodes.INTERNAL_SERVER_ERROR;
-  err.status = err.status ?? 'error';
-  const isDev = process.env.NODE_ENV === 'development';
+  requestId: string,
+): void => {
+  const statusCode = sanitizeStatusCode(err.status ?? err.statusCode);
+  const status = err.errStatus ?? (statusCode >= 500 ? 'error' : 'fail');
 
-  if (!err)
-    err = new HTTPException(
-      'Unknown error occurred',
-      StatusCodes.INTERNAL_SERVER_ERROR,
-    );
+  res.setHeader('X-Request-Id', requestId);
 
-  switch (err.name) {
-    case 'CastError':
-      err = handleInvalidFieldError(err);
-      break;
-    case 'ValidationError':
-      err = handleInputValidationError(err);
-      break;
-    case 'DocumentNotFoundError':
-      err = handleDocumentNotFoundError();
-      break;
-    case 'StrictModeError':
-      err = handleStrictModeError(err);
-      break;
-    case 'MissingSchemaError':
-      err = handleMissingSchemaError(err);
-      break;
-    case 'DisconnectedError':
-      err = handleDisconnectedError();
-      break;
-    case 'JsonWebTokenError':
-      err = handleInvalidTokenError();
-      break;
-    case 'TokenExpiredError':
-      err = handleExpiredTokenError();
-      break;
-    case 'NotBeforeError':
-      err = handleInactiveTokenError();
-      break;
-    default:
-      if (err.code === 11000) {
-        err = handleMongoServerError(err);
-      } else {
-        err = handleNodeError(err);
-      }
-      break;
+  if (err.headers) {
+    Object.entries(err.headers).forEach(([key, value]) => {
+      res.setHeader(key, value);
+    });
   }
 
-  sendError(err, res, isDev);
-  next();
+  if (IS_DEV) {
+    res
+      .status(statusCode)
+      .json({ status, message: err.message, stack: err.stack, requestId });
+    return;
+  }
+
+  if (IS_STAGING && err.expose) {
+    res.status(statusCode).json({ status, message: err.message, requestId });
+    return;
+  }
+
+  if (err.expose) {
+    res.status(statusCode).json({ status, message: err.message, requestId });
+    return;
+  }
+
+  res.status(StatusCodes.INTERNAL_SERVER_ERROR).json({
+    status: 'error',
+    message: 'Something went wrong. Try again later.',
+    requestId,
+  });
+};
+
+export const catchAsync =
+  (
+    fn: (req: Request, res: Response, next: NextFunction) => Promise<void>,
+  ): RequestHandler =>
+  (req, res, next) => {
+    fn(req, res, next).catch(next);
+  };
+
+export const globalErrorHandler = (
+  err: unknown,
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void => {
+  if (res.headersSent) {
+    next(err);
+    return;
+  }
+
+  const requestId = getRequestId(req);
+  const incoming = normalizeError(err);
+  const resolved = resolveError(incoming);
+  const statusCode = sanitizeStatusCode(resolved.status ?? resolved.statusCode);
+
+  const logData = {
+    requestId,
+    method: req.method,
+    url: req.originalUrl,
+    ip: getClientIp(req),
+    userId: (req as Request & { user?: { id?: string } }).user?.id,
+    statusCode,
+    message: incoming.message,
+    stack: incoming.stack,
+  };
+
+  if (statusCode >= StatusCodes.INTERNAL_SERVER_ERROR) {
+    logger.error(logData, 'Internal server error');
+  } else if (statusCode >= StatusCodes.BAD_REQUEST) {
+    logger.warn(logData, 'Client error');
+  }
+
+  sendError(resolved, res, requestId);
+};
+
+export const notFoundHandler = (
+  req: Request,
+  _res: Response,
+  next: NextFunction,
+): void => {
+  next(
+    createError(
+      StatusCodes.NOT_FOUND,
+      `Can't find ${req.originalUrl} on this server!`,
+    ),
+  );
+};
+
+const SHUTDOWN_TIMEOUT_MS = 10_000;
+
+const performGracefulShutdown = (
+  server: { close: (cb?: () => void) => void },
+  exitCode: number,
+): void => {
+  const timer = setTimeout(() => {
+    logger.error('Graceful shutdown timed out. Forcing exit.');
+    process.exit(exitCode);
+  }, SHUTDOWN_TIMEOUT_MS);
+
+  timer.unref();
+
+  server.close(() => {
+    logger.info('Server closed gracefully.');
+    process.exit(exitCode);
+  });
+};
+
+export const registerProcessErrorHandlers = (server?: {
+  close: (cb?: () => void) => void;
+}): void => {
+  if (process.listenerCount('unhandledRejection') > 0) return;
+
+  process.on('unhandledRejection', (reason) => {
+    const err = normalizeError(reason);
+    logger.fatal({ stack: err.stack }, `Unhandled Rejection: ${err.message}`);
+    if (server) {
+      performGracefulShutdown(server, 1);
+    } else {
+      process.exit(1);
+    }
+  });
+
+  process.on('uncaughtException', (err) => {
+    logger.fatal({ stack: err.stack }, `Uncaught Exception: ${err.message}`);
+    if (server) {
+      performGracefulShutdown(server, 1);
+    } else {
+      process.exit(1);
+    }
+  });
+
+  process.on('SIGTERM', () => {
+    logger.info('SIGTERM received.');
+    if (server) {
+      performGracefulShutdown(server, 0);
+    } else {
+      process.exit(0);
+    }
+  });
+
+  process.on('SIGINT', () => {
+    logger.info('SIGINT received.');
+    if (server) {
+      performGracefulShutdown(server, 0);
+    } else {
+      process.exit(0);
+    }
+  });
 };
