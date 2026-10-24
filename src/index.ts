@@ -6,9 +6,23 @@ import {
 } from 'express';
 import createError, { type HttpError } from 'http-errors';
 import { StatusCodes } from 'http-status-codes';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { randomUUID } from 'node:crypto';
+import pino from 'pino';
+
+interface RequestStore {
+  requestId: string;
+}
 
 interface FieldError {
   field: string;
+  message: string;
+}
+
+interface RawIssue {
+  path?: string;
+  kind?: string;
+  name?: string;
   message: string;
 }
 
@@ -17,7 +31,7 @@ interface RawError extends Error {
   path?: string;
   kind?: string;
   keyValue?: Record<string, unknown>;
-  errors?: Record<string, { path?: string; message: string }>;
+  errors?: Record<string, RawIssue>;
   issues?: { path: PropertyKey[]; message: string }[];
 }
 
@@ -28,9 +42,69 @@ interface ApiErrorOptions {
   headers?: Record<string, string>;
 }
 
+interface Rule {
+  test: (err: RawError) => boolean;
+  handle: Handler;
+}
+
+export interface ErrorContext {
+  requestId?: string;
+  method?: string;
+  path?: string;
+  userId?: string;
+  statusCode?: number;
+  fatal?: boolean;
+}
+
+export type ErrorReporter = (
+  error: Error,
+  context: ErrorContext,
+) => void | Promise<void>;
+
 type ApiError = HttpError & { code?: string; errors?: FieldError[] };
 type Handler = (err: RawError) => ApiError;
 type RequestWithUser = Request & { userId?: string };
+
+const storage = new AsyncLocalStorage<RequestStore>();
+const SAFE_REQUEST_ID = /^[A-Za-z0-9._-]{8,128}$/;
+const isProduction = process.env.NODE_ENV === 'production';
+const isDevelopment = process.env.NODE_ENV === 'development';
+
+export const getRequestId = (): string | undefined =>
+  storage.getStore()?.requestId;
+
+export const logger = pino({
+  level: process.env.LOG_LEVEL ?? (isProduction ? 'info' : 'debug'),
+  base: { service: process.env.SERVICE_NAME ?? 'api' },
+  timestamp: pino.stdTimeFunctions.isoTime,
+  formatters: { level: (label) => ({ level: label }) },
+  mixin: () => ({ requestId: getRequestId() }),
+  redact: {
+    paths: [
+      'req.headers.authorization',
+      'req.headers.cookie',
+      '*.password',
+      '*.token',
+      '*.accessToken',
+      '*.refreshToken',
+      '*.authorization',
+      '*.cookie',
+    ],
+    censor: '[REDACTED]',
+  },
+  transport: isDevelopment
+    ? { target: 'pino-pretty', options: { colorize: true } }
+    : undefined,
+});
+
+export const requestId: RequestHandler = (req, res, next) => {
+  const incoming = req.get('x-request-id');
+  const id =
+    incoming && SAFE_REQUEST_ID.test(incoming) ? incoming : randomUUID();
+  res.locals.requestId = id;
+  res.setHeader('X-Request-Id', id);
+  storage.run({ requestId: id }, next);
+};
 
 const MESSAGES = {
   generic:
@@ -68,7 +142,41 @@ const MESSAGES = {
   inactiveToken: "Your session isn't active yet. Please try again shortly.",
   malformedUrl:
     'That link looks broken. Please check the address and try again.',
+  bodyParseFailed:
+    "We couldn't read your request. Please check the format and try again.",
+  payloadTooLarge:
+    'Your request is too large. Please send less data and try again.',
+  unsupportedBody:
+    "We can't read the format of your request. Please try a different one.",
+  requestAborted: 'Your request was interrupted. Please try again.',
 } as const;
+
+const HTTP_TYPES: Record<string, { message: string; code: string }> = {
+  'entity.parse.failed': {
+    message: MESSAGES.bodyParseFailed,
+    code: 'INVALID_BODY',
+  },
+  'request.size.invalid': {
+    message: MESSAGES.bodyParseFailed,
+    code: 'INVALID_BODY',
+  },
+  'entity.too.large': {
+    message: MESSAGES.payloadTooLarge,
+    code: 'PAYLOAD_TOO_LARGE',
+  },
+  'encoding.unsupported': {
+    message: MESSAGES.unsupportedBody,
+    code: 'UNSUPPORTED_BODY',
+  },
+  'charset.unsupported': {
+    message: MESSAGES.unsupportedBody,
+    code: 'UNSUPPORTED_BODY',
+  },
+  'request.aborted': {
+    message: MESSAGES.requestAborted,
+    code: 'REQUEST_ABORTED',
+  },
+};
 
 const UNAVAILABLE_CODES = new Set([
   'ECONNREFUSED',
@@ -80,26 +188,101 @@ const UNAVAILABLE_CODES = new Set([
 
 const TIMEOUT_CODES = new Set(['ETIMEDOUT', 'ESOCKETTIMEDOUT']);
 
+let reporter: ErrorReporter | undefined;
+
+export const setErrorReporter = (fn: ErrorReporter | undefined): void => {
+  reporter = fn;
+};
+
+const report = (error: Error, context: ErrorContext): void => {
+  if (!reporter) return;
+  try {
+    const result = reporter(error, context);
+    if (result instanceof Promise) {
+      result.catch((reporterError: unknown) =>
+        logger.error({ err: reporterError }, 'error reporter failed'),
+      );
+    }
+  } catch (reporterError) {
+    logger.error({ err: reporterError }, 'error reporter failed');
+  }
+};
+
+const reportAndWait = async (
+  error: Error,
+  context: ErrorContext,
+  timeoutMs: number,
+): Promise<void> => {
+  if (!reporter) return;
+  try {
+    await Promise.race([
+      Promise.resolve(reporter(error, context)),
+      new Promise<void>((resolve) => setTimeout(resolve, timeoutMs).unref()),
+    ]);
+  } catch (reporterError) {
+    logger.error({ err: reporterError }, 'error reporter failed');
+  }
+};
+
 const build = (
   statusCode: number,
   message: string,
   options: ApiErrorOptions = {},
 ): ApiError => createError(statusCode, message, options) as ApiError;
 
-const sentence = (text: string): string =>
-  /[.!?]$/.test(text.trim()) ? text.trim() : `${text.trim()}.`;
+const sentence = (text: string): string => {
+  const trimmed = text.trim();
+  return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
+};
 
-const joinMessages = (errors: FieldError[]): string =>
-  errors.map((e) => sentence(e.message)).join(' ');
+const humanize = (field: string): string => {
+  const last =
+    field
+      .split('.')
+      .filter((segment) => segment && !/^\d+$/.test(segment))
+      .pop() ?? 'This field';
+  const words = last
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/[_-]+/g, ' ')
+    .trim()
+    .toLowerCase();
+  return words.charAt(0).toUpperCase() + words.slice(1);
+};
 
 const quoteList = (items: string[]): string =>
   items.map((item) => `"${item}"`).join(', ');
+
+const describeIssue = (issue: RawIssue): string => {
+  const label = humanize(issue.path ?? '');
+  if (issue.name === 'CastError') return `${label} has an invalid value.`;
+  switch (issue.kind) {
+    case 'required':
+      return `${label} is required.`;
+    case 'minlength':
+      return `${label} is too short.`;
+    case 'maxlength':
+      return `${label} is too long.`;
+    case 'min':
+      return `${label} is too small.`;
+    case 'max':
+      return `${label} is too large.`;
+    case 'enum':
+      return `${label} has an option we don't recognize.`;
+    default:
+      return sentence(issue.message);
+  }
+};
+
+const summarize = (errors: FieldError[]): string =>
+  `Please fix the following and try again: ${errors
+    .map((e) => e.message)
+    .join(' ')}`;
 
 const handleCastError: Handler = (err) =>
   build(
     StatusCodes.BAD_REQUEST,
     err.path
-      ? `The value you entered for "${err.path}" doesn't look right. Please check it and try again.`
+      ? `${humanize(err.path)} has an invalid value. Please check it and try again.`
       : MESSAGES.badInput,
     {
       code: 'INVALID_FIELD',
@@ -113,30 +296,33 @@ const handleCastError: Handler = (err) =>
   );
 
 const handleValidationError: Handler = (err) => {
-  const entries = err.errors
+  const issues: RawIssue[] = err.errors
     ? Object.values(err.errors)
     : [{ path: err.path, message: err.message }];
-  const errors = entries.map((entry) => ({
-    field: entry.path ?? '',
-    message: entry.message,
+  const errors = issues.map((issue) => ({
+    field: issue.path ?? '',
+    message: describeIssue(issue),
   }));
-  return build(
-    StatusCodes.UNPROCESSABLE_ENTITY,
-    `Please fix the following and try again: ${joinMessages(errors)}`,
-    { code: 'VALIDATION_FAILED', errors },
-  );
+  return build(StatusCodes.UNPROCESSABLE_ENTITY, summarize(errors), {
+    code: 'VALIDATION_FAILED',
+    errors,
+  });
 };
 
 const handleZodError: Handler = (err) => {
-  const errors = (err.issues ?? []).map((issue) => ({
-    field: issue.path.map(String).join('.'),
-    message: issue.message,
-  }));
-  return build(
-    StatusCodes.UNPROCESSABLE_ENTITY,
-    `Please fix the following and try again: ${joinMessages(errors)}`,
-    { code: 'VALIDATION_FAILED', errors },
-  );
+  const errors = (err.issues ?? []).map((issue) => {
+    const field = issue.path.map(String).join('.');
+    return {
+      field,
+      message: field
+        ? `${humanize(field)}: ${sentence(issue.message)}`
+        : sentence(issue.message),
+    };
+  });
+  return build(StatusCodes.UNPROCESSABLE_ENTITY, summarize(errors), {
+    code: 'VALIDATION_FAILED',
+    errors,
+  });
 };
 
 const handleDocumentNotFound: Handler = () =>
@@ -179,7 +365,6 @@ const handleMongoServerError: Handler = (err) => {
     case 121:
       return build(StatusCodes.UNPROCESSABLE_ENTITY, MESSAGES.dbValidation, {
         code: 'DB_VALIDATION_FAILED',
-        expose: true,
       });
     case 112:
       return build(StatusCodes.CONFLICT, MESSAGES.writeConflict, {
@@ -267,66 +452,83 @@ const handleSystemError = (err: RawError): ApiError | undefined => {
   return undefined;
 };
 
-const HANDLERS = new Map<string, Handler>();
+const byName =
+  (...names: string[]) =>
+  (err: RawError): boolean =>
+    names.includes(err.name);
 
-const register = (names: string[], handler: Handler): void => {
-  for (const name of names) HANDLERS.set(name, handler);
-};
+const byPattern =
+  (pattern: RegExp) =>
+  (err: RawError): boolean =>
+    pattern.test(err.name);
 
-register(['CastError'], handleCastError);
-register(['ValidationError', 'ValidatorError'], handleValidationError);
-register(['ZodError'], handleZodError);
-register(['DocumentNotFoundError'], handleDocumentNotFound);
-register(['StrictModeError', 'StrictPopulateError'], handleStrictMode);
-register(
-  ['ObjectParameterError', 'BSONError', 'BSONTypeError'],
-  handleBadInput,
-);
-register(['VersionError', 'ParallelSaveError'], handleConflict);
-register(['MongoServerError', 'MongoBulkWriteError'], handleMongoServerError);
-register(
-  [
-    'DisconnectedError',
-    'MongoNetworkError',
-    'MongoNetworkTimeoutError',
-    'MongoServerSelectionError',
-    'MongooseServerSelectionError',
-    'MongoTopologyClosedError',
-    'MongoNotConnectedError',
-    'MongoPoolClearedError',
-    'MongoPoolClosedError',
-  ],
-  handleDatabaseUnavailable,
-);
-register(
-  [
-    'ClientClosedError',
-    'ClientOfflineError',
-    'ConnectionTimeoutError',
-    'SocketClosedUnexpectedlyError',
-    'SocketTimeoutError',
-    'ReconnectStrategyError',
-  ],
-  handleCacheUnavailable,
-);
-register(['MulterError'], handleMulterError);
-register(['JsonWebTokenError'], handleInvalidToken);
-register(['TokenExpiredError'], handleExpiredToken);
-register(['NotBeforeError'], handleInactiveToken);
-register(['URIError'], handleMalformedUrl);
+const RULES: Rule[] = [
+  { test: byName('CastError'), handle: handleCastError },
+  {
+    test: byName('ValidationError', 'ValidatorError'),
+    handle: handleValidationError,
+  },
+  { test: byName('ZodError'), handle: handleZodError },
+  { test: byName('DocumentNotFoundError'), handle: handleDocumentNotFound },
+  {
+    test: byName('StrictModeError', 'StrictPopulateError'),
+    handle: handleStrictMode,
+  },
+  {
+    test: byName('ObjectParameterError', 'BSONError', 'BSONTypeError'),
+    handle: handleBadInput,
+  },
+  {
+    test: byName('VersionError', 'ParallelSaveError'),
+    handle: handleConflict,
+  },
+  {
+    test: byName('MongoServerError', 'MongoBulkWriteError'),
+    handle: handleMongoServerError,
+  },
+  {
+    test: (err) =>
+      err.name === 'DisconnectedError' ||
+      /^(Mongo|Mongoose).*(Network|ServerSelection|Topology|PoolCleared|PoolClosed|NotConnected)/.test(
+        err.name,
+      ),
+    handle: handleDatabaseUnavailable,
+  },
+  {
+    test: byPattern(
+      /^(ClientClosed|ClientOffline|ConnectionTimeout|SocketClosed|SocketTimeout|Reconnect)/,
+    ),
+    handle: handleCacheUnavailable,
+  },
+  { test: byName('MulterError'), handle: handleMulterError },
+  { test: byName('JsonWebTokenError'), handle: handleInvalidToken },
+  { test: byName('TokenExpiredError'), handle: handleExpiredToken },
+  { test: byName('NotBeforeError'), handle: handleInactiveToken },
+  { test: byName('URIError'), handle: handleMalformedUrl },
+];
 
 const toRawError = (value: unknown): RawError => {
   if (value instanceof Error) return value as RawError;
   return new Error(
-    typeof value === 'string' ? value : MESSAGES.unknown,
+    typeof value === 'string' && value ? value : MESSAGES.unknown,
   ) as RawError;
 };
 
-const normalizeError = (err: RawError): ApiError => {
-  if (createError.isHttpError(err)) return err as ApiError;
+const refineHttpError = (err: ApiError): ApiError => {
+  const type = (err as { type?: unknown }).type;
+  const known = typeof type === 'string' ? HTTP_TYPES[type] : undefined;
+  if (!known) return err;
+  return build(err.statusCode, known.message, {
+    code: known.code,
+    expose: true,
+  });
+};
 
-  const handler = HANDLERS.get(err.name);
-  if (handler) return handler(err);
+const normalizeError = (err: RawError): ApiError => {
+  if (createError.isHttpError(err)) return refineHttpError(err as ApiError);
+
+  const rule = RULES.find((candidate) => candidate.test(err));
+  if (rule) return rule.handle(err);
 
   if (err.code === 11000 || err.code === 11001) return handleDuplicateKey(err);
 
@@ -343,28 +545,6 @@ const resolveStatusCode = (err: ApiError): number =>
   err.statusCode >= 400 && err.statusCode <= 599
     ? err.statusCode
     : StatusCodes.INTERNAL_SERVER_ERROR;
-
-const logError = (
-  raw: RawError,
-  req: RequestWithUser,
-  statusCode: number,
-): void => {
-  if (statusCode < StatusCodes.INTERNAL_SERVER_ERROR) return;
-  console.error(
-    JSON.stringify({
-      level: 'error',
-      time: new Date().toISOString(),
-      method: req.method,
-      path: req.path,
-      statusCode,
-      requestId: req.get('x-request-id'),
-      userId: req.userId,
-      name: raw.name,
-      message: raw.message,
-      stack: raw.stack,
-    }),
-  );
-};
 
 export const notFoundHandler: RequestHandler = (req, _res, next) => {
   next(
@@ -387,9 +567,37 @@ export const globalErrorHandler = (
   const apiError = normalizeError(raw);
   const statusCode = resolveStatusCode(apiError);
   const isDev = process.env.NODE_ENV === 'development';
+  const currentRequestId =
+    (res.locals.requestId as string | undefined) ?? getRequestId();
+  const userId = (req as RequestWithUser).userId;
 
-  logError(raw, req as RequestWithUser, statusCode);
+  if (statusCode >= StatusCodes.INTERNAL_SERVER_ERROR) {
+    logger.error(
+      { err: raw, method: req.method, path: req.path, statusCode, userId },
+      'request failed',
+    );
+    report(raw, {
+      requestId: currentRequestId,
+      method: req.method,
+      path: req.path,
+      userId,
+      statusCode,
+    });
+  } else {
+    logger.warn(
+      {
+        errName: raw.name,
+        errMessage: raw.message,
+        method: req.method,
+        path: req.path,
+        statusCode,
+        userId,
+      },
+      'request rejected',
+    );
+  }
 
+  res.set('Cache-Control', 'no-store');
   if (apiError.headers) res.set(apiError.headers);
 
   const body: Record<string, unknown> = {
@@ -403,10 +611,7 @@ export const globalErrorHandler = (
   if (apiError.expose && apiError.errors?.length) {
     body.errors = apiError.errors;
   }
-
-  const requestId = req.get('x-request-id');
-  if (requestId) body.requestId = requestId;
-
+  if (currentRequestId) body.requestId = currentRequestId;
   if (isDev) {
     body.debug = { name: raw.name, message: raw.message, stack: raw.stack };
   }
@@ -416,6 +621,7 @@ export const globalErrorHandler = (
 
 export const registerProcessErrorHandlers = (
   shutdown: () => Promise<void> | void,
+  timeoutMs = 10_000,
 ): void => {
   let shuttingDown = false;
 
@@ -423,33 +629,29 @@ export const registerProcessErrorHandlers = (
     if (shuttingDown) return;
     shuttingDown = true;
 
-    if (error) {
-      const raw = toRawError(error);
-      console.error(
-        JSON.stringify({
-          level: 'fatal',
-          time: new Date().toISOString(),
-          reason,
-          name: raw.name,
-          message: raw.message,
-          stack: raw.stack,
-        }),
-      );
+    const raw = error === undefined ? undefined : toRawError(error);
+
+    if (raw) {
+      logger.fatal({ err: raw, reason }, 'fatal error, shutting down');
+      await reportAndWait(raw, { fatal: true }, 2_000);
+    } else {
+      logger.info({ reason }, 'shutdown signal received');
     }
 
-    setTimeout(() => process.exit(1), 10_000).unref();
+    setTimeout(() => process.exit(1), timeoutMs).unref();
 
+    let exitCode = raw ? 1 : 0;
     try {
       await shutdown();
     } catch (shutdownError) {
-      console.error(shutdownError);
-    } finally {
-      process.exit(error ? 1 : 0);
+      exitCode = 1;
+      logger.error({ err: shutdownError }, 'shutdown failed');
     }
+    process.exit(exitCode);
   };
 
   process.on('unhandledRejection', (reason) => {
-    void exit('unhandledRejection', reason);
+    void exit('unhandledRejection', reason ?? 'Unhandled rejection');
   });
   process.on('uncaughtException', (error) => {
     void exit('uncaughtException', error);

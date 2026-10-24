@@ -52,7 +52,8 @@
   },
   "dependencies": {
     "http-errors": "^2.0.1",
-    "http-status-codes": "^2.3.0"
+    "http-status-codes": "^2.3.0",
+    "pino": "^10.4.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
