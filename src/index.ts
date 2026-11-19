@@ -260,6 +260,27 @@ const reportAndWait = async (
   }
 };
 
+const flushLogger = async (timeoutMs: number): Promise<void> => {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      new Promise<void>((resolve) => {
+        try {
+          logger.flush(() => resolve());
+        } catch {
+          resolve();
+        }
+      }),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, timeoutMs);
+        timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+};
+
 const build = (
   statusCode: number,
   message: string,
@@ -340,9 +361,10 @@ const extractDuplicateFields = (err: RawError): string[] => {
   for (const msg of messages) {
     const block = DUP_KEY_BLOCK.exec(msg);
     if (!block) continue;
-    const keysOnly = block[1].replace(QUOTED_VALUE, '""');
+    const keysOnly = (block[1] ?? '').replace(QUOTED_VALUE, '""');
     for (const match of keysOnly.matchAll(DUP_KEY_FIELD)) {
-      fields.add(match[1]);
+      const field = match[1];
+      if (field) fields.add(field);
     }
     if (fields.size) break;
   }
@@ -372,7 +394,14 @@ const handleCastError: Handler = (err) => {
 const handleValidationError: Handler = (err) => {
   const issues: RawIssue[] = err.errors
     ? Object.values(err.errors)
-    : [{ path: err.path, message: err.message }];
+    : [
+        {
+          path: err.path,
+          kind: err.kind,
+          name: err.name,
+          message: err.message,
+        },
+      ];
   const errors = issues.map((issue) => ({
     field: issue.path ?? '',
     message: describeIssue(issue),
@@ -576,6 +605,7 @@ const refineHttpError = (err: ApiError): ApiError => {
   return build(err.statusCode, known.message, {
     code: known.code,
     expose: true,
+    headers: err.headers,
   });
 };
 
@@ -634,7 +664,14 @@ export const globalErrorHandler = (
 
   if (isServerError) {
     logger.error(
-      { err: raw, method: req.method, path: req.path, statusCode, userId },
+      {
+        err: raw,
+        requestId: currentRequestId,
+        method: req.method,
+        path: req.path,
+        statusCode,
+        userId,
+      },
       'request failed',
     );
     report(raw, {
@@ -648,8 +685,8 @@ export const globalErrorHandler = (
     logger.warn(
       {
         errName: raw.name,
-        errMessage:
-          apiError.code === 'DUPLICATE_KEY' ? 'duplicate key' : raw.message,
+        errMessage: apiError.message,
+        requestId: currentRequestId,
         method: req.method,
         path: req.path,
         statusCode,
@@ -722,6 +759,7 @@ export const registerProcessErrorHandlers = (
       exitCode = 1;
       logger.error({ err: shutdownError }, 'shutdown failed');
     }
+    await flushLogger(1_000);
     process.exit(exitCode);
   };
 
