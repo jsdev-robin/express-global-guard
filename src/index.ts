@@ -79,7 +79,8 @@ const TERMINAL_PUNCTUATION = /[.!?]$/;
 const NUMERIC_SEGMENT = /^\d+$/;
 const CAMEL_BOUNDARY = /([a-z0-9])([A-Z])/g;
 const WORD_SEPARATORS = /[_-]+/g;
-const DUP_KEY_BLOCK = /dup key:\s*\{([^}]*)\}/;
+const DUP_KEY_BLOCK = /dup key:\s*\{((?:"(?:[^"\\]|\\.)*"|[^}"])*)\}/;
+const QUOTED_VALUE = /"(?:[^"\\]|\\.)*"/g;
 const DUP_KEY_FIELD = /([A-Za-z0-9_.$]+)\s*:/g;
 const DB_UNAVAILABLE_NAME =
   /^(Mongo|Mongoose).*(Network|ServerSelection|Topology|PoolCleared|PoolClosed|NotConnected)/;
@@ -113,6 +114,10 @@ export const logger = pino({
       '*.*.refreshToken',
       '*.*.authorization',
       '*.*.cookie',
+      'err.keyValue',
+      'err.errmsg',
+      'err.writeErrors',
+      'err.errorResponse',
     ],
     censor: '[REDACTED]',
   },
@@ -335,7 +340,8 @@ const extractDuplicateFields = (err: RawError): string[] => {
   for (const msg of messages) {
     const block = DUP_KEY_BLOCK.exec(msg);
     if (!block) continue;
-    for (const match of block[1].matchAll(DUP_KEY_FIELD)) {
+    const keysOnly = block[1].replace(QUOTED_VALUE, '""');
+    for (const match of keysOnly.matchAll(DUP_KEY_FIELD)) {
       fields.add(match[1]);
     }
     if (fields.size) break;
@@ -642,7 +648,8 @@ export const globalErrorHandler = (
     logger.warn(
       {
         errName: raw.name,
-        errMessage: raw.message,
+        errMessage:
+          apiError.code === 'DUPLICATE_KEY' ? 'duplicate key' : raw.message,
         method: req.method,
         path: req.path,
         statusCode,
@@ -692,12 +699,14 @@ export const registerProcessErrorHandlers = (
     if (shuttingDown) return;
     shuttingDown = true;
 
+    const raw = error === undefined ? undefined : toRawError(error);
+
+    if (raw) process.exitCode = 1;
+
     setTimeout(() => {
       logger.error({ reason, timeoutMs }, 'shutdown timed out, forcing exit');
       process.exit(1);
     }, timeoutMs).unref();
-
-    const raw = error === undefined ? undefined : toRawError(error);
 
     if (raw) {
       logger.fatal({ err: raw, reason }, 'fatal error, shutting down');
