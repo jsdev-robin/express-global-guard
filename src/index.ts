@@ -26,6 +26,12 @@ interface RawIssue {
   message: string;
 }
 
+interface BulkWriteIssue {
+  code?: number;
+  errmsg?: string;
+  err?: { code?: number; errmsg?: string };
+}
+
 interface RawError extends Error {
   code?: string | number;
   path?: string;
@@ -33,6 +39,8 @@ interface RawError extends Error {
   keyValue?: Record<string, unknown>;
   errors?: Record<string, RawIssue>;
   issues?: { path: PropertyKey[]; message: string }[];
+  writeErrors?: BulkWriteIssue[];
+  errmsg?: string;
 }
 
 interface ApiErrorOptions {
@@ -67,6 +75,16 @@ type RequestWithUser = Request & { userId?: string };
 
 const storage = new AsyncLocalStorage<RequestStore>();
 const SAFE_REQUEST_ID = /^[A-Za-z0-9._-]{8,128}$/;
+const TERMINAL_PUNCTUATION = /[.!?]$/;
+const NUMERIC_SEGMENT = /^\d+$/;
+const CAMEL_BOUNDARY = /([a-z0-9])([A-Z])/g;
+const WORD_SEPARATORS = /[_-]+/g;
+const DUP_KEY_BLOCK = /dup key:\s*\{([^}]*)\}/;
+const DUP_KEY_FIELD = /([A-Za-z0-9_.$]+)\s*:/g;
+const DB_UNAVAILABLE_NAME =
+  /^(Mongo|Mongoose).*(Network|ServerSelection|Topology|PoolCleared|PoolClosed|NotConnected)/;
+const CACHE_UNAVAILABLE_NAME =
+  /^(ClientClosed|ClientOffline|ConnectionTimeout|SocketClosed|SocketTimeout|Reconnect)/;
 const isProduction = process.env.NODE_ENV === 'production';
 const isDevelopment = process.env.NODE_ENV === 'development';
 
@@ -89,6 +107,12 @@ export const logger = pino({
       '*.refreshToken',
       '*.authorization',
       '*.cookie',
+      '*.*.password',
+      '*.*.token',
+      '*.*.accessToken',
+      '*.*.refreshToken',
+      '*.*.authorization',
+      '*.*.cookie',
     ],
     censor: '[REDACTED]',
   },
@@ -189,6 +213,7 @@ const UNAVAILABLE_CODES = new Set([
 const TIMEOUT_CODES = new Set(['ETIMEDOUT', 'ESOCKETTIMEDOUT']);
 
 let reporter: ErrorReporter | undefined;
+let handlersRegistered = false;
 
 export const setErrorReporter = (fn: ErrorReporter | undefined): void => {
   reporter = fn;
@@ -214,13 +239,19 @@ const reportAndWait = async (
   timeoutMs: number,
 ): Promise<void> => {
   if (!reporter) return;
+  let timer: NodeJS.Timeout | undefined;
   try {
     await Promise.race([
       Promise.resolve(reporter(error, context)),
-      new Promise<void>((resolve) => setTimeout(resolve, timeoutMs).unref()),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, timeoutMs);
+        timer.unref();
+      }),
     ]);
   } catch (reporterError) {
     logger.error({ err: reporterError }, 'error reporter failed');
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 };
 
@@ -228,22 +259,30 @@ const build = (
   statusCode: number,
   message: string,
   options: ApiErrorOptions = {},
-): ApiError => createError(statusCode, message, options) as ApiError;
+): ApiError =>
+  createError(statusCode, message, {
+    ...options,
+    expose: options.expose ?? statusCode < StatusCodes.INTERNAL_SERVER_ERROR,
+  }) as ApiError;
 
 const sentence = (text: string): string => {
   const trimmed = text.trim();
-  return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
+  return TERMINAL_PUNCTUATION.test(trimmed) ? trimmed : `${trimmed}.`;
 };
 
 const humanize = (field: string): string => {
-  const last =
-    field
-      .split('.')
-      .filter((segment) => segment && !/^\d+$/.test(segment))
-      .pop() ?? 'This field';
+  const segments = field.split('.');
+  let last = 'This field';
+  for (let i = segments.length - 1; i >= 0; i--) {
+    const segment = segments[i];
+    if (segment && !NUMERIC_SEGMENT.test(segment)) {
+      last = segment;
+      break;
+    }
+  }
   const words = last
-    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
-    .replace(/[_-]+/g, ' ')
+    .replace(CAMEL_BOUNDARY, '$1 $2')
+    .replace(WORD_SEPARATORS, ' ')
     .trim()
     .toLowerCase();
   return words.charAt(0).toUpperCase() + words.slice(1);
@@ -274,26 +313,55 @@ const describeIssue = (issue: RawIssue): string => {
 };
 
 const summarize = (errors: FieldError[]): string =>
-  `Please fix the following and try again: ${errors
-    .map((e) => e.message)
-    .join(' ')}`;
+  errors.length
+    ? `Please fix the following and try again: ${errors
+        .map((e) => e.message)
+        .join(' ')}`
+    : MESSAGES.badInput;
 
-const handleCastError: Handler = (err) =>
-  build(
+const extractDuplicateFields = (err: RawError): string[] => {
+  const direct = Object.keys(err.keyValue ?? {});
+  if (direct.length) return direct;
+
+  const messages: string[] = [];
+  if (err.errmsg) messages.push(err.errmsg);
+  if (err.message) messages.push(err.message);
+  for (const writeError of err.writeErrors ?? []) {
+    const msg = writeError.errmsg ?? writeError.err?.errmsg;
+    if (msg) messages.push(msg);
+  }
+
+  const fields = new Set<string>();
+  for (const msg of messages) {
+    const block = DUP_KEY_BLOCK.exec(msg);
+    if (!block) continue;
+    for (const match of block[1].matchAll(DUP_KEY_FIELD)) {
+      fields.add(match[1]);
+    }
+    if (fields.size) break;
+  }
+  return [...fields];
+};
+
+const resolveMongoCode = (err: RawError): string | number | undefined => {
+  if (err.code !== undefined) return err.code;
+  const first = err.writeErrors?.[0];
+  return first?.code ?? first?.err?.code;
+};
+
+const handleCastError: Handler = (err) => {
+  const message = err.path
+    ? `${humanize(err.path)} has an invalid value.`
+    : 'Something has an invalid value.';
+  return build(
     StatusCodes.BAD_REQUEST,
-    err.path
-      ? `${humanize(err.path)} has an invalid value. Please check it and try again.`
-      : MESSAGES.badInput,
+    err.path ? `${message} Please check it and try again.` : MESSAGES.badInput,
     {
       code: 'INVALID_FIELD',
-      errors: [
-        {
-          field: err.path ?? '',
-          message: `Expected a valid ${err.kind ?? 'value'}.`,
-        },
-      ],
+      errors: [{ field: err.path ?? '', message }],
     },
   );
+};
 
 const handleValidationError: Handler = (err) => {
   const issues: RawIssue[] = err.errors
@@ -344,7 +412,7 @@ const handleConflict: Handler = () =>
   build(StatusCodes.CONFLICT, MESSAGES.conflict, { code: 'CONFLICT' });
 
 const handleDuplicateKey: Handler = (err) => {
-  const fields = Object.keys(err.keyValue ?? {});
+  const fields = extractDuplicateFields(err);
   const message = fields.length
     ? `Looks like ${quoteList(fields)} already exists. Please use a different value.`
     : 'Looks like that already exists. Please use a different value.';
@@ -358,7 +426,7 @@ const handleDuplicateKey: Handler = (err) => {
 };
 
 const handleMongoServerError: Handler = (err) => {
-  switch (err.code) {
+  switch (resolveMongoCode(err)) {
     case 11000:
     case 11001:
       return handleDuplicateKey(err);
@@ -376,7 +444,9 @@ const handleMongoServerError: Handler = (err) => {
         expose: true,
       });
     default:
-      return build(StatusCodes.INTERNAL_SERVER_ERROR, MESSAGES.generic);
+      return build(StatusCodes.INTERNAL_SERVER_ERROR, MESSAGES.generic, {
+        code: 'DB_ERROR',
+      });
   }
 };
 
@@ -452,59 +522,38 @@ const handleSystemError = (err: RawError): ApiError | undefined => {
   return undefined;
 };
 
-const byName =
-  (...names: string[]) =>
-  (err: RawError): boolean =>
-    names.includes(err.name);
+const NAME_HANDLERS = new Map<string, Handler>([
+  ['CastError', handleCastError],
+  ['ValidationError', handleValidationError],
+  ['ValidatorError', handleValidationError],
+  ['ZodError', handleZodError],
+  ['DocumentNotFoundError', handleDocumentNotFound],
+  ['StrictModeError', handleStrictMode],
+  ['StrictPopulateError', handleStrictMode],
+  ['ObjectParameterError', handleBadInput],
+  ['BSONError', handleBadInput],
+  ['BSONTypeError', handleBadInput],
+  ['VersionError', handleConflict],
+  ['ParallelSaveError', handleConflict],
+  ['MongoServerError', handleMongoServerError],
+  ['MongoBulkWriteError', handleMongoServerError],
+  ['MulterError', handleMulterError],
+  ['JsonWebTokenError', handleInvalidToken],
+  ['TokenExpiredError', handleExpiredToken],
+  ['NotBeforeError', handleInactiveToken],
+  ['URIError', handleMalformedUrl],
+]);
 
-const byPattern =
-  (pattern: RegExp) =>
-  (err: RawError): boolean =>
-    pattern.test(err.name);
-
-const RULES: Rule[] = [
-  { test: byName('CastError'), handle: handleCastError },
-  {
-    test: byName('ValidationError', 'ValidatorError'),
-    handle: handleValidationError,
-  },
-  { test: byName('ZodError'), handle: handleZodError },
-  { test: byName('DocumentNotFoundError'), handle: handleDocumentNotFound },
-  {
-    test: byName('StrictModeError', 'StrictPopulateError'),
-    handle: handleStrictMode,
-  },
-  {
-    test: byName('ObjectParameterError', 'BSONError', 'BSONTypeError'),
-    handle: handleBadInput,
-  },
-  {
-    test: byName('VersionError', 'ParallelSaveError'),
-    handle: handleConflict,
-  },
-  {
-    test: byName('MongoServerError', 'MongoBulkWriteError'),
-    handle: handleMongoServerError,
-  },
+const PATTERN_RULES: Rule[] = [
   {
     test: (err) =>
-      err.name === 'DisconnectedError' ||
-      /^(Mongo|Mongoose).*(Network|ServerSelection|Topology|PoolCleared|PoolClosed|NotConnected)/.test(
-        err.name,
-      ),
+      err.name === 'DisconnectedError' || DB_UNAVAILABLE_NAME.test(err.name),
     handle: handleDatabaseUnavailable,
   },
   {
-    test: byPattern(
-      /^(ClientClosed|ClientOffline|ConnectionTimeout|SocketClosed|SocketTimeout|Reconnect)/,
-    ),
+    test: (err) => CACHE_UNAVAILABLE_NAME.test(err.name),
     handle: handleCacheUnavailable,
   },
-  { test: byName('MulterError'), handle: handleMulterError },
-  { test: byName('JsonWebTokenError'), handle: handleInvalidToken },
-  { test: byName('TokenExpiredError'), handle: handleExpiredToken },
-  { test: byName('NotBeforeError'), handle: handleInactiveToken },
-  { test: byName('URIError'), handle: handleMalformedUrl },
 ];
 
 const toRawError = (value: unknown): RawError => {
@@ -527,10 +576,16 @@ const refineHttpError = (err: ApiError): ApiError => {
 const normalizeError = (err: RawError): ApiError => {
   if (createError.isHttpError(err)) return refineHttpError(err as ApiError);
 
-  const rule = RULES.find((candidate) => candidate.test(err));
-  if (rule) return rule.handle(err);
+  const named = NAME_HANDLERS.get(err.name);
+  if (named) return named(err);
 
-  if (err.code === 11000 || err.code === 11001) return handleDuplicateKey(err);
+  for (const rule of PATTERN_RULES) {
+    if (rule.test(err)) return rule.handle(err);
+  }
+
+  const mongoCode = resolveMongoCode(err);
+  if (mongoCode === 11000 || mongoCode === 11001)
+    return handleDuplicateKey(err);
 
   const systemError = handleSystemError(err);
   if (systemError) return systemError;
@@ -566,12 +621,12 @@ export const globalErrorHandler = (
   const raw = toRawError(err);
   const apiError = normalizeError(raw);
   const statusCode = resolveStatusCode(apiError);
-  const isDev = process.env.NODE_ENV === 'development';
   const currentRequestId =
     (res.locals.requestId as string | undefined) ?? getRequestId();
   const userId = (req as RequestWithUser).userId;
+  const isServerError = statusCode >= StatusCodes.INTERNAL_SERVER_ERROR;
 
-  if (statusCode >= StatusCodes.INTERNAL_SERVER_ERROR) {
+  if (isServerError) {
     logger.error(
       { err: raw, method: req.method, path: req.path, statusCode, userId },
       'request failed',
@@ -597,12 +652,17 @@ export const globalErrorHandler = (
     );
   }
 
-  res.set('Cache-Control', 'no-store');
-  if (apiError.headers) res.set(apiError.headers);
+  res.setHeader('Cache-Control', 'no-store');
+  if (apiError.headers) {
+    for (const key of Object.keys(apiError.headers)) {
+      res.setHeader(key, apiError.headers[key] as string);
+    }
+  }
 
   const body: Record<string, unknown> = {
-    status: statusCode >= StatusCodes.INTERNAL_SERVER_ERROR ? 'error' : 'fail',
-    message: isDev || apiError.expose ? apiError.message : MESSAGES.generic,
+    status: isServerError ? 'error' : 'fail',
+    message:
+      isDevelopment || apiError.expose ? apiError.message : MESSAGES.generic,
   };
 
   if (apiError.expose && typeof apiError.code === 'string') {
@@ -612,7 +672,7 @@ export const globalErrorHandler = (
     body.errors = apiError.errors;
   }
   if (currentRequestId) body.requestId = currentRequestId;
-  if (isDev) {
+  if (isDevelopment) {
     body.debug = { name: raw.name, message: raw.message, stack: raw.stack };
   }
 
@@ -623,11 +683,19 @@ export const registerProcessErrorHandlers = (
   shutdown: () => Promise<void> | void,
   timeoutMs = 10_000,
 ): void => {
+  if (handlersRegistered) return;
+  handlersRegistered = true;
+
   let shuttingDown = false;
 
   const exit = async (reason: string, error?: unknown): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
+
+    setTimeout(() => {
+      logger.error({ reason, timeoutMs }, 'shutdown timed out, forcing exit');
+      process.exit(1);
+    }, timeoutMs).unref();
 
     const raw = error === undefined ? undefined : toRawError(error);
 
@@ -637,8 +705,6 @@ export const registerProcessErrorHandlers = (
     } else {
       logger.info({ reason }, 'shutdown signal received');
     }
-
-    setTimeout(() => process.exit(1), timeoutMs).unref();
 
     let exitCode = raw ? 1 : 0;
     try {
